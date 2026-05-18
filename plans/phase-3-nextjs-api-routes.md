@@ -59,12 +59,24 @@ export async function POST(req: NextRequest) {
 ### `src/app/api/synthesize/route.ts`
 Calls Gemini directly from Next.js (keeps `GEMINI_API_KEY` server-side). Returns a **streaming text response** so the UI can progressively render the synthesis.
 
+Caching strategy: synthesis output is stable for as long as the underlying events are (30 min). Use a module-level Map cache keyed by ticker with a 30-min TTL. On a cache hit, return the stored text immediately as a plain response. On a cache miss, stream from Gemini while collecting chunks, then store the result before closing the stream.
+
 ```ts
 import { NextRequest } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+const synthesisCache = new Map<string, { text: string; expires: number }>();
+const SYNTHESIS_TTL_MS = 30 * 60 * 1000;
+
 export async function POST(req: NextRequest) {
   const { ticker, name, events } = await req.json();
+
+  const cached = synthesisCache.get(ticker);
+  if (cached && Date.now() < cached.expires) {
+    return new Response(cached.text, {
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
 
   const eventsText = events
     .map((e: { date: string; title: string; description: string }) =>
@@ -83,12 +95,17 @@ Identify the single highest-risk week where macro events most directly collide w
 
   const result = await model.generateContentStream(prompt);
 
+  const chunks: string[] = [];
   const stream = new ReadableStream({
     async start(controller) {
       for await (const chunk of result.stream) {
         const text = chunk.text();
-        if (text) controller.enqueue(new TextEncoder().encode(text));
+        if (text) {
+          chunks.push(text);
+          controller.enqueue(new TextEncoder().encode(text));
+        }
       }
+      synthesisCache.set(ticker, { text: chunks.join(""), expires: Date.now() + SYNTHESIS_TTL_MS });
       controller.close();
     },
   });
@@ -145,5 +162,5 @@ curl -X POST "http://localhost:3000/api/synthesize" \
 
 ## Commit
 ```
-feat(api): Next.js route handlers — ticker proxy, macro-scout proxy, Gemini synthesis stream
+feat(api): Next.js route handlers — ticker proxy, macro-scout proxy, Gemini synthesis stream with caching
 ```
