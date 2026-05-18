@@ -6,6 +6,7 @@ Build the FastAPI microservice that supplies all financial data to the Next.js f
 ## Pre-conditions
 - Phase 1 complete: `python/` directory exists with stub files and `requirements.txt`
 - `pip install -r python/requirements.txt` has been run
+- `requirements.txt` must include `cachetools>=5.3` (in-process TTL cache for both services)
 
 ---
 
@@ -32,6 +33,25 @@ Two functions used by the other services:
 
 ### `python/ticker_service.py`
 **`get_ticker_data(ticker: str) -> dict`**
+
+Add a module-level TTL cache (5 min) so repeated requests within the ISR window don't re-hit yfinance:
+
+```python
+from cachetools import TTLCache
+from cachetools.keys import hashkey
+
+_cache: TTLCache = TTLCache(maxsize=256, ttl=300)
+
+def get_ticker_data(ticker: str) -> dict:
+    key = hashkey(ticker)
+    if key in _cache:
+        return _cache[key]
+    result = _fetch_ticker_data(ticker)   # rename existing logic to _fetch_ticker_data
+    _cache[key] = result
+    return result
+```
+
+**`_fetch_ticker_data(ticker: str) -> dict`** (internal)
 
 Uses `yfinance.Ticker(ticker)`:
 1. `t.history(period="6mo")` → convert index to `YYYY-MM-DD` strings, return list of `{date, close}` dicts (close rounded to 2 decimal places)
@@ -64,6 +84,25 @@ Error handling: catch all exceptions, return `{"error": str(e)}` with HTTP 400.
 
 ### `python/macro_service.py`
 **`get_macro_events(ticker: str, industry: str, sector: str) -> dict`**
+
+Add a module-level TTL cache (30 min) — this is the most expensive pipeline (Gemini × 2 + DuckDuckGo × 3 + FRED × 2) and macro events don't change frequently:
+
+```python
+from cachetools import TTLCache
+from cachetools.keys import hashkey
+
+_cache: TTLCache = TTLCache(maxsize=256, ttl=1800)
+
+def get_macro_events(ticker: str, industry: str, sector: str) -> dict:
+    key = hashkey(ticker, industry, sector)
+    if key in _cache:
+        return _cache[key]
+    result = _fetch_macro_events(ticker, industry, sector)  # rename existing logic to _fetch_macro_events
+    _cache[key] = result
+    return result
+```
+
+**`_fetch_macro_events(ticker: str, industry: str, sector: str) -> dict`** (internal)
 
 1. **Gemini queries**: call `gemini_service.generate_search_queries(industry, sector)` → get 3 search queries
 2. **DuckDuckGo search**: for each query, call `DDGS().text(query, max_results=5)` → collect `body` snippets into a single text blob
@@ -132,5 +171,5 @@ Expected: ticker endpoint returns JSON with `prices` array of 100+ items and `ne
 
 ## Commit
 ```
-feat(python): FastAPI microservice — ticker data, macro scout, Gemini + DuckDuckGo
+feat(python): FastAPI microservice — ticker data, macro scout, Gemini + DuckDuckGo, TTL caching
 ```
